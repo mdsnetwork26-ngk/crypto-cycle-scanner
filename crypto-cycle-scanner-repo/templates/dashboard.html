@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crypto Cycle Scanner — pemindai kemiripan fase siklus</title>
+<style>
+  :root{--bg:#0b1220;--card:#131c2e;--line:#24314d;--txt:#e8eef9;--mut:#93a4c3;
+        --up:#2fbf71;--down:#e5534b;--mid:#e8b93e;--accent:#4f8cff}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  .wrap{max-width:1180px;margin:0 auto;padding:20px 16px 60px}
+  header h1{margin:4px 0 2px;font-size:26px} header p{margin:0;color:var(--mut)}
+  .banner{background:#2a2113;border:1px solid #6b5518;color:#f3d98b;border-radius:10px;
+    padding:10px 14px;font-size:13px;margin:16px 0}
+  .demo{background:#3a1420;border:1px solid #7a2436;color:#ffb9c4}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:16px;margin:14px 0}
+  form.scan{display:flex;flex-wrap:wrap;gap:10px;align-items:end}
+  label{font-size:12px;color:var(--mut);display:block;margin-bottom:4px}
+  select,input[type=number],input[type=text]{background:#0d1626;color:var(--txt);
+    border:1px solid var(--line);border-radius:8px;padding:9px 10px;font-size:14px}
+  button{background:var(--accent);color:#fff;border:0;border-radius:8px;
+    padding:10px 18px;font-size:14px;cursor:pointer;font-weight:600}
+  button:disabled{opacity:.5}
+  .bar{height:8px;background:#0d1626;border-radius:6px;overflow:hidden;margin-top:8px}
+  .bar>div{height:100%;background:var(--accent);transition:width .4s}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:right;
+    vertical-align:middle}
+  th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;
+    letter-spacing:.04em}
+  td.l,th.l{text-align:left}
+  .badge{display:inline-block;padding:3px 9px;border-radius:20px;font-size:12px;
+    font-weight:700;white-space:nowrap}
+  .b-up{background:rgba(47,191,113,.16);color:var(--up)}
+  .b-down{background:rgba(229,83,75,.16);color:var(--down)}
+  .b-mid{background:rgba(232,185,62,.16);color:var(--mid)}
+  .score{font-weight:800;font-size:16px}
+  .pos{color:var(--up)} .neg{color:var(--down)}
+  .mut{color:var(--mut);font-size:12px}
+  .sym{font-weight:800;font-size:15px}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .seg a{padding:8px 14px;color:var(--mut);font-size:13px}
+  .seg a.on{background:var(--accent);color:#fff;font-weight:700}
+  @media(max-width:900px){.hide-m{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>🔭 Crypto Cycle Scanner</h1>
+    <p>Memindai koin Indodax yang fasenya mirip episode historis banyak koin —
+       lalu melaporkan apa yang <em>nyata</em> terjadi pada episode-episode itu
+       {{ '30 hari' if horizon == 30 else '1 tahun' }} kemudian.</p>
+  </header>
+
+  {% if demo %}
+  <div class="banner demo">⚠️ <strong>MODE DEMO</strong> — data sintetis untuk mencoba
+    tampilan, bukan data pasar. Matikan <code>DEMO_MODE</code> untuk data Indodax asli.</div>
+  {% endif %}
+  <div class="banner">ℹ️ <strong>Alat riset, bukan rekomendasi finansial.</strong>
+    Angka “potensi” adalah statistik episode historis yang mirip (kemiripan bentuk
+    grafik + fase teknikal), bukan ramalan. Selalu periksa episode analog asalnya
+    di halaman detail sebelum mengambil keputusan.</div>
+
+  <div class="card">
+    <form class="scan" method="post" action="/scan">
+      <div>
+        <label>Horizon potensi</label>
+        <select name="horizon_days">
+          <option value="30" {{ 'selected' if horizon == 30 }}>1 bulan (30 hari)</option>
+          <option value="365" {{ 'selected' if horizon == 365 }}>1 tahun (365 hari)</option>
+        </select>
+      </div>
+      <div>
+        <label>Jumlah koin terlaris dipindai</label>
+        <input type="number" name="max_coins" value="40" min="5" max="120">
+      </div>
+      <div>
+        <label>Volume harian minimum</label>
+        <select name="min_volume_idr">
+          <option value="0">semua</option>
+          <option value="100000000" selected>≥ Rp100 jt</option>
+          <option value="1000000000">≥ Rp1 M</option>
+          <option value="10000000000">≥ Rp10 M</option>
+        </select>
+      </div>
+      <button type="submit" {{ 'disabled' if running }}>🔄 Pindai sekarang</button>
+      <span class="mut">Hasil terakhir: {{ scan.finished_at | tgl if scan else 'belum ada pemindaian' }}</span>
+    </form>
+    {% if running %}
+    <div id="prog">
+      <div class="mut" style="margin-top:10px">⏳ Pemindaian #{{ running.id }} berjalan —
+        <span id="stage">{{ running.stage }}</span></div>
+      <div class="bar"><div id="bar" style="width:{{ (100 * (running.analyzed or 0) / running.total) if running.total else 3 }}%"></div></div>
+    </div>
+    <script>
+      const el = document.getElementById('stage'), bar = document.getElementById('bar');
+      const timer = setInterval(async () => {
+        try {
+          const r = await fetch('/api/scan/status?scan_id={{ running.id }}');
+          const s = await r.json();
+          if (s.stage) el.textContent = s.stage;
+          if (s.total) bar.style.width = Math.max(3, 100 * (s.analyzed || 0) / s.total) + '%';
+          if (s.status && s.status !== 'running') { clearInterval(timer); location.reload(); }
+        } catch (e) { /* abaikan sesaat */ }
+      }, 3000);
+    </script>
+    {% endif %}
+  </div>
+
+  <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:18px 0 4px">
+    <div class="seg">
+      <a href="/?horizon=30" class="{{ 'on' if horizon == 30 }}">Potensi 1 bulan</a>
+      <a href="/?horizon=365" class="{{ 'on' if horizon == 365 }}">Potensi 1 tahun</a>
+    </div>
+    <form method="get" style="display:flex;gap:8px;flex-wrap:wrap">
+      <input type="hidden" name="horizon" value="{{ horizon }}">
+      <input type="text" name="q" value="{{ q }}" placeholder="cari koin… (mis. SUI)">
+      <select name="kelas">
+        <option value="">semua kelas</option>
+        {% for c in classes %}
+        <option value="{{ c }}" {{ 'selected' if kelas == c }}>{{ c }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Saring</button>
+    </form>
+  </div>
+
+  {% if scan %}
+  <p class="mut">Pemindaian #{{ scan.id }} · horizon {{ scan.horizon_days }} hari ·
+     {{ scan.analyzed }} koin dianalisa · {{ scan.total }} kandidat ·
+     {{ scan.message or '' }}</p>
+  {% endif %}
+
+  {% if results %}
+  <div class="card" style="padding:6px 14px">
+  <table>
+    <thead><tr>
+      <th class="l">Koin</th><th>Harga</th><th class="hide-m">24 jam</th>
+      <th>Skor</th><th class="l">Kelas</th><th>Peluang naik</th>
+      <th>Median analog</th><th class="hide-m">Skenario P25–P75</th>
+      <th class="hide-m">Volume/hari</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for r in results %}
+      <tr>
+        <td class="l"><span class="sym">{{ r.symbol }}</span>
+          <div class="mut">{{ r.name }}</div></td>
+        <td>{{ r.price | price }}</td>
+        <td class="hide-m {{ 'pos' if r.change_24h_pct >= 0 else 'neg' }}">{{ r.change_24h_pct | pct }}</td>
+        <td><span class="score">{{ r.score }}</span></td>
+        <td class="l">{% if r.classification == 'Potensi Naik' %}<span class="badge b-up">▲ Potensi Naik</span>
+          {% elif r.classification == 'Potensi Turun' %}<span class="badge b-down">▼ Potensi Turun</span>
+          {% else %}<span class="badge b-mid">➖ Netral / Menunggu</span>{% endif %}</td>
+        <td>{{ r.probability_up | pct(False) }}</td>
+        <td class="{{ 'pos' if r.median_pct >= 0 else 'neg' }}">{{ r.median_pct | pct }}</td>
+        <td class="hide-m mut">{{ r.scenario_p25 | price }} – {{ r.scenario_p75 | price }}</td>
+        <td class="hide-m">{{ r.volume_idr | idr }}</td>
+        <td><a href="/coin/{{ r.pair_id }}?scan_id={{ scan.id }}">detail →</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% elif scan %}
+  <div class="card">Tidak ada koin yang cocok dengan saringan ini.</div>
+  {% else %}
+  <div class="card">Belum ada hasil untuk horizon ini. Klik <strong>Pindai sekarang</strong> —
+    pemindaian pertama mengambil candle ±3 tahun untuk puluhan koin sehingga butuh
+    beberapa menit; berikutnya jauh lebih cepat karena data tersimpan lokal.</div>
+  {% endif %}
+
+  {% if scans %}
+  <div class="card">
+    <strong>Riwayat pemindaian</strong>
+    <table style="margin-top:8px">
+      <thead><tr><th class="l">#</th><th>Horizon</th><th class="l">Status</th>
+        <th class="l">Tahap</th><th>Dianalisa</th><th class="l">Catatan</th></tr></thead>
+      <tbody>
+      {% for s in scans %}
+        <tr><td class="l">{{ s.id }}</td><td>{{ s.horizon_days }} hari</td>
+          <td class="l">{{ s.status }}</td><td class="l">{{ s.stage }}</td>
+          <td>{{ s.analyzed }}/{{ s.total }}</td><td class="l mut">{{ s.message or '' }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <strong>Cara membaca angka ini</strong>
+    <ul style="color:var(--mut);font-size:13.5px;line-height:1.65">
+      <li><strong>Skor 0–100</strong> menggabungkan peluang naik para analog, median
+        hasil mereka, kemiripan rata-rata, dan skor tren — dikurangi penalti
+        likuiditas/spread.</li>
+      <li><strong>Peluang naik &amp; median analog</strong> berasal dari episode
+        historis nyata (banyak koin, banyak siklus — bukan hanya Solana 2022):
+        keadaan koin hari ini dicocokkan dengan keadaan koin-koin di masa lalu,
+        lalu dilihat hasil nyatanya {{ '30 hari' if horizon == 30 else '1 tahun' }} sesudahnya.</li>
+      <li><strong>Skenario P25–P75</strong> adalah rentang hasil tengah para analog —
+        bukan target harga. Klik <em>detail</em> untuk melihat episode analognya satu per satu.</li>
+    </ul>
+  </div>
+</div>
+</body>
+</html>

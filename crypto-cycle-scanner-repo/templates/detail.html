@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ result.symbol if result else pair_id }} — detail Crypto Cycle Scanner</title>
+<style>
+  :root{--bg:#0b1220;--card:#131c2e;--line:#24314d;--txt:#e8eef9;--mut:#93a4c3;
+        --up:#2fbf71;--down:#e5534b;--mid:#e8b93e;--accent:#4f8cff}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  .wrap{max-width:1000px;margin:0 auto;padding:20px 16px 60px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:16px;margin:14px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .stat{background:#0d1626;border:1px solid var(--line);border-radius:10px;padding:12px}
+  .stat .v{font-size:20px;font-weight:800} .stat .k{color:var(--mut);font-size:12px}
+  .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12.5px;font-weight:700}
+  .b-up{background:rgba(47,191,113,.16);color:var(--up)}
+  .b-down{background:rgba(229,83,75,.16);color:var(--down)}
+  .b-mid{background:rgba(232,185,62,.16);color:var(--mid)}
+  .pos{color:var(--up)} .neg{color:var(--down)} .mut{color:var(--mut);font-size:12.5px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{padding:8px;border-bottom:1px solid var(--line);text-align:right}
+  th{color:var(--mut);font-size:12px;text-transform:uppercase} td.l,th.l{text-align:left}
+  .meter{height:12px;background:#0d1626;border-radius:7px;overflow:hidden}
+  .meter>div{height:100%;background:linear-gradient(90deg,#e5534b,#e8b93e,#2fbf71)}
+  ul{line-height:1.7;font-size:13.5px} .plus li::marker{content:"➕ "} .minus li::marker{content:"➖ "}
+  h1{margin:2px 0} h3{margin:6px 0 10px}
+  svg{width:100%;height:auto;background:#0d1626;border-radius:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p><a href="/?horizon={{ result.horizon_days if result else 30 }}">← kembali ke dasbor</a></p>
+
+  {% if not result %}
+  <div class="card">
+    <h1>{{ pair_id }}</h1>
+    <p>Belum ada hasil analisa untuk koin ini pada pemindaian terakhir.
+       Jalankan pemindaian dari dasbor (pastikan volume hariannya melewati ambang
+       dan riwayat pair minimal ±1 tahun).</p>
+  </div>
+  {% else %}
+  <h1>{{ result.symbol }} <span class="mut" style="font-size:16px">{{ result.name }} · {{ result.pair_id }}</span></h1>
+  <p style="font-size:22px;margin:4px 0">{{ result.price | price }}
+     <span class="{{ 'pos' if result.change_24h_pct >= 0 else 'neg' }}" style="font-size:15px">{{ result.change_24h_pct | pct }} / 24 jam</span></p>
+  <p>
+    {% if result.classification == 'Potensi Naik' %}<span class="badge b-up">▲ Potensi Naik</span>
+    {% elif result.classification == 'Potensi Turun' %}<span class="badge b-down">▼ Potensi Turun</span>
+    {% else %}<span class="badge b-mid">➖ Netral / Menunggu</span>{% endif %}
+    <span class="mut">horizon {{ result.horizon_days }} hari · data per {{ result.as_of_ts | tgl }} ·
+    {{ result.episodes_used }} episode acuan · {{ result.n_candles }} candle harian</span>
+  </p>
+  {% if demo %}<p class="badge b-mid">MODE DEMO — data sintetis</p>{% endif %}
+
+  <div class="card">
+    <h3>Skor kemiripan-fase: {{ result.score }} / 100</h3>
+    <div class="meter"><div style="width:{{ result.score }}%"></div></div>
+    <div class="grid" style="margin-top:14px">
+      <div class="stat"><div class="k">Peluang naik (analog)</div>
+        <div class="v">{{ result.probability_up | pct(False) }}</div></div>
+      <div class="stat"><div class="k">Peluang naik &gt; {{ result.big_threshold_pct }}%</div>
+        <div class="v">{{ result.probability_big | pct(False) }}</div></div>
+      <div class="stat"><div class="k">Median hasil analog</div>
+        <div class="v {{ 'pos' if result.median_pct >= 0 else 'neg' }}">{{ result.median_pct | pct }}</div></div>
+      <div class="stat"><div class="k">Penurunan terdalam khas analog</div>
+        <div class="v neg">{{ result.forward_drawdown_median_pct | pct }}</div></div>
+      <div class="stat"><div class="k">Kemiripan rata-rata</div>
+        <div class="v">{{ result.similarity_avg }}%</div></div>
+      <div class="stat"><div class="k">Skor tren teknikal</div>
+        <div class="v">{{ result.trend_score }}</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Skenario harga dari distribusi analog (bukan target harga)</h3>
+    <div class="grid">
+      <div class="stat"><div class="k">Pesimis (P25) · {{ result.p25_pct | pct }}</div>
+        <div class="v">{{ result.scenario_p25 | price }}</div></div>
+      <div class="stat"><div class="k">Tengah (median) · {{ result.median_pct | pct }}</div>
+        <div class="v">{{ result.scenario_median | price }}</div></div>
+      <div class="stat"><div class="k">Optimis (P75) · {{ result.p75_pct | pct }}</div>
+        <div class="v">{{ result.scenario_p75 | price }}</div></div>
+    </div>
+    <p class="mut">Harga skenario = harga sekarang × (1 + hasil analog). Separuh episode
+      analog berakhir di antara P25 dan P75; hasil di luar rentang tetap mungkin.</p>
+  </div>
+
+  {% if spark %}
+  <div class="card">
+    <h3>Grafik 1 tahun terakhir</h3>
+    <svg viewBox="0 0 720 180" preserveAspectRatio="none">
+      <polyline points="{{ spark }}" fill="none" stroke="#4f8cff" stroke-width="2"/>
+    </svg>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h3>Mengapa skornya begini</h3>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px">
+      <ul class="plus">{% for r in result.reasons_plus %}<li>{{ r }}</li>{% endfor %}
+        {% if not result.reasons_plus %}<li class="mut">tidak ada faktor pendukung menonjol</li>{% endif %}</ul>
+      <ul class="minus">{% for r in result.reasons_minus %}<li>{{ r }}</li>{% endfor %}
+        {% if not result.reasons_minus %}<li class="mut">tidak ada faktor risiko menonjol</li>{% endif %}</ul>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Keadaan teknikal saat ini</h3>
+    <table>
+      <tbody>
+        <tr><td class="l">Jarak dari puncak data (drawdown ATH)</td><td>{{ (result.features.drawdown_ath * 100) | pct }}</td></tr>
+        <tr><td class="l">Kenaikan dari dasar 365 hari</td><td>{{ (result.features.dist_low_365 * 100) | pct }}</td></tr>
+        <tr><td class="l">RSI-14</td><td>{{ result.features.rsi_14 }}</td></tr>
+        <tr><td class="l">Posisi vs MA-50</td><td>{{ (result.features.dist_ma50 * 100) | pct }}</td></tr>
+        <tr><td class="l">Posisi vs MA-200</td><td>{{ (result.features.dist_ma200 * 100) | pct }}</td></tr>
+        <tr><td class="l">Perubahan 30 / 90 / 365 hari</td>
+            <td>{{ (result.features.ret_30 * 100) | pct }} · {{ (result.features.ret_90 * 100) | pct }} · {{ (result.features.ret_365 * 100) | pct }}</td></tr>
+        <tr><td class="l">Volatilitas 30 hari (tahunan)</td><td>{{ (result.features.vol_30 * 100) | pct(False) }}</td></tr>
+        <tr><td class="l">Rasio volatilitas 30/90 hari</td><td>{{ result.features.vol_ratio }}</td></tr>
+        <tr><td class="l">Tren volume 30 vs 180 hari</td><td>{{ (result.features.volume_trend * 100) | pct }}</td></tr>
+        <tr><td class="l">Kekuatan relatif vs BTC (90 hari)</td><td>{{ (result.features.rel_btc_90 * 100) | pct }}</td></tr>
+        <tr><td class="l">Volume Indodax / hari</td><td>{{ result.volume_idr | idr }}</td></tr>
+        <tr><td class="l">Spread bid–ask</td><td>{{ result.spread_pct }}%</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  {% if result.sol_reference %}
+  <div class="card">
+    <h3>🪐 Pembanding favorit: dasar Solana akhir 2022</h3>
+    <p>Kemiripan keadaan {{ result.symbol }} sekarang dengan fase dasar SOL sekitar
+       <strong>{{ result.sol_reference.date_ts | tgl }}</strong>:
+       <strong>{{ result.sol_reference.similarity }}%</strong>.
+       {% if result.sol_reference.sol_forward_365_pct is not none %}
+       Untuk konteks, SOL sendiri bergerak {{ result.sol_reference.sol_forward_365_pct | pct }}
+       dalam 365 hari setelah titik itu.{% endif %}</p>
+    <p class="mut">Pembanding ini hanya referensi yang akrab — skor utama koin ini berasal
+       dari seluruh perpustakaan episode multi-koin di bawah, bukan dari SOL.</p>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h3>Episode analog terdekat (bukti di balik angka)</h3>
+    <p class="mut">Keadaan-keadaan historis yang paling mirip dengan {{ result.symbol }} hari ini,
+       beserta hasil nyatanya {{ result.horizon_days }} hari kemudian. Inilah bahan baku
+       statistik di atas — nilai sendiri apakah analognya masuk akal.</p>
+    <table>
+      <thead><tr><th class="l">Koin</th><th class="l">Tanggal keadaan</th>
+        <th>Kemiripan</th><th>Hasil {{ result.horizon_days }} hari</th>
+        <th>Sempat jatuh</th><th>Sempat naik</th></tr></thead>
+      <tbody>
+      {% for a in analogs %}
+        <tr><td class="l"><strong>{{ a.symbol }}</strong></td>
+          <td class="l">{{ a.date_label }}</td>
+          <td>{{ a.similarity }}%</td>
+          <td class="{{ 'pos' if a.forward_return_pct >= 0 else 'neg' }}">{{ a.forward_return_pct | pct }}</td>
+          <td class="neg">{{ a.forward_drawdown_pct | pct }}</td>
+          <td class="pos">{{ a.forward_gain_pct | pct }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <p class="mut">Metode: keadaan koin direkam sebagai 15 fitur (drawdown dari puncak,
+      RSI, posisi vs MA-50/200, volatilitas, tren volume, kekuatan relatif vs BTC, dst.)
+      ditambah bentuk grafik 26 titik mingguan. Pencocokan dua tahap: jarak fitur
+      terstandardisasi, lalu kemiripan bentuk (DTW). Hasil = distribusi hasil nyata
+      episode-episode terdekat di perpustakaan multi-koin. Ini alat bantu riset —
+      bukan saran membeli/menjual. Kripto sangat berisiko; masa lalu tidak menjamin masa depan.</p>
+  </div>
+  {% endif %}
+</div>
+</body>
+</html>
