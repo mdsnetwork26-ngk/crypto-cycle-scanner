@@ -183,6 +183,14 @@ class Database:
                 "ORDER BY id DESC LIMIT 1", (horizon_days,)).fetchone()
         return dict(row) if row else None
 
+    def scans_between(self, start_ts: int, end_ts: int) -> list[dict]:
+        """Pemindaian yang dimulai dalam rentang [start_ts, end_ts)."""
+        with self.connect() as c:
+            rows = c.execute(
+                "SELECT * FROM scans WHERE started_at>=? AND started_at<? "
+                "ORDER BY started_at", (int(start_ts), int(end_ts))).fetchall()
+        return [dict(r) for r in rows]
+
     def list_scans(self, limit: int = 10) -> list[dict]:
         with self.connect() as c:
             rows = c.execute(

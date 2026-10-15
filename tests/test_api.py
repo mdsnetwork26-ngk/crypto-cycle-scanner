@@ -11,6 +11,7 @@ client = TestClient(app)
 @pytest.fixture(scope="module", autouse=True)
 def _pindai_demo():
     run_scan(30, max_coins=8, min_volume_idr=0)
+    run_scan(7, max_coins=8, min_volume_idr=0)
 
 
 def test_health():

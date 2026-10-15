@@ -16,13 +16,22 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .config import settings
-from .services import db, run_scan, start_scan
+from .evaluate import available_months, monthly_report
+from .scheduler import schedule_info, start_scheduler
+from .services import HORIZONS, db, run_scan, start_scan
 
 WIB = timezone(timedelta(hours=7))
 BASE_DIR = Path(__file__).resolve().parent.parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
+HORIZON_LABELS = {7: "Potensi 1 minggu", 30: "Potensi 1 bulan", 365: "Potensi 1 tahun"}
+
 app = FastAPI(title="Crypto Cycle Scanner")
+
+
+@app.on_event("startup")
+def _mulai_penjadwal() -> None:
+    start_scheduler()
 
 
 def fmt_idr(value) -> str:
@@ -85,7 +94,7 @@ def health():
 def dashboard(request: Request, horizon: int = Query(30),
               q: str = Query(""), kelas: str = Query(""),
               scan_id: int | None = Query(None)):
-    if horizon not in (30, 365):
+    if horizon not in HORIZONS:
         horizon = 30
     scan = db.latest_done_scan(horizon) if scan_id is None else db.get_scan(scan_id)
     results = db.scan_results(scan["id"]) if scan else []
@@ -107,6 +116,10 @@ def dashboard(request: Request, horizon: int = Query(30),
             "running": running if running and running["status"] == "running" else None,
             "classes": ["Potensi Naik", "Netral / Menunggu", "Potensi Turun"],
             "demo": settings.demo_mode,
+            "horizon_options": [
+                {"days": h, "label": HORIZON_LABELS[h]} for h in sorted(HORIZONS)],
+            "horizon_short": HORIZON_LABELS[horizon].replace("Potensi ", ""),
+            "sched": schedule_info(),
         },
     )
 
@@ -114,7 +127,7 @@ def dashboard(request: Request, horizon: int = Query(30),
 @app.post("/scan")
 def trigger_scan(horizon_days: int = Form(...), max_coins: int = Form(40),
                  min_volume_idr: float = Form(100_000_000)):
-    if horizon_days not in (30, 365):
+    if horizon_days not in HORIZONS:
         horizon_days = 30
     max_coins = max(5, min(120, int(max_coins)))
     scan_id = start_scan(horizon_days, max_coins, float(min_volume_idr))
@@ -127,6 +140,30 @@ def trigger_scan_sync(horizon_days: int = Form(...), max_coins: int = Form(40),
     """Versi sinkron — dipakai skrip/uji; dasbor memakai /scan (latar)."""
     run_scan(horizon_days, max(5, min(120, int(max_coins))), float(min_volume_idr))
     return RedirectResponse(f"/?horizon={horizon_days}", status_code=303)
+
+
+@app.get("/evaluasi", response_class=HTMLResponse)
+def evaluasi(request: Request, year: int | None = Query(None),
+             month: int | None = Query(None)):
+    months = available_months(db)
+    now = datetime.now(WIB)
+    if year is not None and year == 0:
+        report = monthly_report(db)
+        selected = "semua"
+    elif year and month and 1 <= month <= 12:
+        report = monthly_report(db, year, month)
+        selected = f"{year}-{month}"
+    else:
+        prev = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
+        keys = {(m["year"], m["month"]) for m in months}
+        chosen = prev if prev in keys else (now.year, now.month)
+        report = monthly_report(db, chosen[0], chosen[1])
+        selected = f"{chosen[0]}-{chosen[1]}"
+    return templates.TemplateResponse(
+        request, "evaluasi.html",
+        {"report": report, "months": months, "selected": selected,
+         "demo": settings.demo_mode, "horizon_labels": HORIZON_LABELS},
+    )
 
 
 @app.get("/api/scan/status")
@@ -156,7 +193,7 @@ def coin_detail(request: Request, pair_id: str,
                 scan_id: int | None = Query(None),
                 horizon: int = Query(30)):
     if scan_id is None:
-        scan = db.latest_done_scan(horizon if horizon in (30, 365) else 30)
+        scan = db.latest_done_scan(horizon if horizon in HORIZONS else 30)
     else:
         scan = db.get_scan(scan_id)
     result = db.result_for_pair(scan["id"], pair_id) if scan else None

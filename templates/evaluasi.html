@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evaluasi Bulanan — Crypto Cycle Scanner</title>
+<style>
+  :root{--bg:#0b1220;--card:#131c2e;--line:#24314d;--txt:#e8eef9;--mut:#93a4c3;
+        --up:#2fbf71;--down:#e5534b;--mid:#e8b93e;--accent:#4f8cff}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  .wrap{max-width:1000px;margin:0 auto;padding:20px 16px 60px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:16px;margin:14px 0}
+  .warn{background:#2a2113;border:1px solid #6b5518;color:#f3d98b;border-radius:10px;
+    padding:10px 14px;font-size:13px;margin:14px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .stat{background:#0d1626;border:1px solid var(--line);border-radius:10px;padding:12px}
+  .stat .v{font-size:19px;font-weight:800} .stat .k{color:var(--mut);font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:6px}
+  th,td{padding:8px;border-bottom:1px solid var(--line);text-align:right}
+  th{color:var(--mut);font-size:12px;text-transform:uppercase} td.l,th.l{text-align:left}
+  .pos{color:var(--up)} .neg{color:var(--down)} .mut{color:var(--mut);font-size:12.5px}
+  select,button{background:#0d1626;color:var(--txt);border:1px solid var(--line);
+    border-radius:8px;padding:9px 10px;font-size:14px}
+  button{background:var(--accent);color:#fff;border:0;cursor:pointer;font-weight:600}
+  h1{margin:4px 0} h2{margin:8px 0 4px} h3{margin:14px 0 4px}
+  ul{line-height:1.7;font-size:13.5px}
+  .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:700}
+  .b-up{background:rgba(47,191,113,.16);color:var(--up)}
+  .b-down{background:rgba(229,83,75,.16);color:var(--down)}
+  .b-mid{background:rgba(232,185,62,.16);color:var(--mid)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p><a href="/">← kembali ke dasbor</a></p>
+  <h1>📊 Evaluasi hasil pemindaian</h1>
+  <p class="mut">Membandingkan kelas &amp; skenario yang dikeluarkan aplikasi dengan
+     harga yang benar-benar terjadi setelah horizonnya lewat. Dibuat {{ report.generated_at }} ·
+     {{ report.n_scans }} pemindaian selesai pada periode ini.</p>
+  {% if demo %}<p class="badge b-mid">MODE DEMO — data sintetis</p>{% endif %}
+
+  <form method="get" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0">
+    <label for="periode">Periode:</label>
+    <select name="periode" id="periode" onchange="pilihPeriode(this)">
+      {% for m in months %}
+      <option value="{{ m.year }}-{{ m.month }}" {{ 'selected' if selected == (m.year ~ '-' ~ m.month) }}>{{ m.label }}</option>
+      {% endfor %}
+      <option value="semua" {{ 'selected' if selected == 'semua' }}>Kumulatif (semua waktu)</option>
+    </select>
+    <span class="mut">Menampilkan: <strong>{{ report.label }}</strong></span>
+  </form>
+  <script>
+    function pilihPeriode(el) {
+      if (el.value === 'semua') { location = '/evaluasi?year=0'; return; }
+      const [y, m] = el.value.split('-');
+      location = `/evaluasi?year=${y}&month=${m}`;
+    }
+  </script>
+
+  {% if report.n_scans == 0 %}
+  <div class="card">Belum ada pemindaian selesai pada periode ini. Jalankan pemindaian
+    dari dasbor — evaluasi akan terisi sendiri setelah horizon pemindaian pertama
+    jatuh tempo (7/30/365 hari).</div>
+  {% endif %}
+
+  {% for horizon, s in report.horizons.items() %}
+  <div class="card">
+    <h2>Horizon {{ horizon }} hari — {{ horizon_labels[horizon] }}</h2>
+    {% if s.n_matured == 0 %}
+    <p class="mut">{{ s.n_total }} hasil tercatat, semuanya belum jatuh tempo.
+      Bagian ini terisi setelah {{ horizon }} hari sejak pemindaian.</p>
+    {% else %}
+    <div class="grid">
+      <div class="stat"><div class="k">Sampel dinilai (matang)</div>
+        <div class="v">{{ s.n_matured }}</div>
+        <div class="k">{{ s.n_pending }} menunggu jatuh tempo</div></div>
+      <div class="stat"><div class="k">Rata-rata realisasi</div>
+        <div class="v {{ 'pos' if s.avg_realized >= 0 else 'neg' }}">{{ s.avg_realized | pct }}</div></div>
+      <div class="stat"><div class="k">Rata-rata BTC (jendela sama)</div>
+        <div class="v">{{ s.avg_btc | pct if s.avg_btc is not none else '—' }}</div></div>
+      <div class="stat"><div class="k">Realisasi masuk rentang P25–P75</div>
+        <div class="v">{{ s.band_pct | pct(False) if s.band_pct is not none else '—' }}</div>
+        <div class="k">ideal kasar ±50%</div></div>
+      <div class="stat"><div class="k">Kekeliruan median (realisasi − skenario)</div>
+        <div class="v">{{ s.median_error | pct if s.median_error is not none else '—' }}</div></div>
+    </div>
+
+    {% if s.n_matured < 20 %}
+    <div class="warn">⚠️ Sampel masih sangat kecil ({{ s.n_matured }}). Angka di bawah ini
+      petunjuk awal, <strong>bukan kesimpulan</strong> — pola yang bisa dipercaya butuh
+      puluhan sampai ratusan sampel per kelas.</div>
+    {% endif %}
+
+    <h3>Kinerja per kelas</h3>
+    <table>
+      <thead><tr><th class="l">Kelas aplikasi</th><th>n</th><th>Arah benar</th>
+        <th>Rata-rata realisasi</th><th>BTC (jendela sama)</th><th>Selisih vs BTC</th></tr></thead>
+      <tbody>
+      {% for c in s.classes %}
+        <tr><td class="l">{% if c.name == 'Potensi Naik' %}<span class="badge b-up">▲ Potensi Naik</span>
+          {% elif c.name == 'Potensi Turun' %}<span class="badge b-down">▼ Potensi Turun</span>
+          {% else %}<span class="badge b-mid">➖ Netral / Menunggu</span>{% endif %}</td>
+          <td>{{ c.n }}</td>
+          <td>{{ (c.hit_pct | pct(False)) if c.hit_pct is not none else '—' }}</td>
+          <td class="{{ 'pos' if c.avg and c.avg >= 0 else 'neg' }}">{{ c.avg | pct if c.avg is not none else '—' }}</td>
+          <td>{{ c.avg_btc | pct if c.avg_btc is not none else '—' }}</td>
+          <td class="{{ 'pos' if c.excess and c.excess >= 0 else 'neg' }}">{{ c.excess | pct if c.excess is not none else '—' }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="mut">Untuk kelas Naik, "arah benar" = harga benar-benar naik; Turun = benar-benar turun;
+      Netral = bergerak di dalam ambang wajar horizon ini. Selisih vs BTC menjawab pertanyaan
+      terpenting: lebih baik daripada sekadar memegang Bitcoin atau tidak.</p>
+
+    {% if s.calibration %}
+    <h3>Kalibrasi probabilitas naik</h3>
+    <table>
+      <thead><tr><th class="l">Peluang naik menurut aplikasi</th><th>n</th><th>Benar-benar naik</th></tr></thead>
+      <tbody>
+      {% for k in s.calibration %}
+        <tr><td class="l">{{ k.label }}</td><td>{{ k.n }}</td><td>{{ k.up_pct | pct(False) }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="mut">Aplikasi yang terkalibrasi baik: baris 55–70% benar-benar naik sekitar 55–70%.</p>
+    {% endif %}
+
+    {% if s.top_bottom %}
+    <h3>Uji peringkat (skor)</h3>
+    <p>5 skor teratas rata-rata <strong class="{{ 'pos' if s.top_bottom.top_avg >= 0 else 'neg' }}">{{ s.top_bottom.top_avg | pct }}</strong>
+       ({{ s.top_bottom.top_symbols }}) vs 5 terbawah
+       <strong class="{{ 'pos' if s.top_bottom.bottom_avg >= 0 else 'neg' }}">{{ s.top_bottom.bottom_avg | pct }}</strong>
+       ({{ s.top_bottom.bottom_symbols }}).</p>
+    {% endif %}
+
+    {% if s.coins_best %}
+    <h3>Pola per koin (muncul ≥2× pada periode ini)</h3>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px">
+      <table>
+        <thead><tr><th class="l">Realisasi terbaik</th><th>n</th><th>Rata-rata</th><th>Arah benar</th></tr></thead>
+        <tbody>{% for c in s.coins_best %}
+          <tr><td class="l"><strong>{{ c.symbol }}</strong></td><td>{{ c.n }}</td>
+            <td class="pos">{{ c.avg | pct }}</td><td>{{ c.hit_pct | pct(False) }}</td></tr>{% endfor %}
+        </tbody>
+      </table>
+      {% if s.coins_worst %}
+      <table>
+        <thead><tr><th class="l">Realisasi terburuk</th><th>n</th><th>Rata-rata</th><th>Arah benar</th></tr></thead>
+        <tbody>{% for c in s.coins_worst %}
+          <tr><td class="l"><strong>{{ c.symbol }}</strong></td><td>{{ c.n }}</td>
+            <td class="neg">{{ c.avg | pct }}</td><td>{{ c.hit_pct | pct(False) }}</td></tr>{% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% if s.notes %}
+    <h3>📝 Catatan pola periode ini</h3>
+    <ul>{% for n in s.notes %}<li>{{ n }}</li>{% endfor %}</ul>
+    {% endif %}
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  <div class="card">
+    <p class="mut">Metode: realisasi diambil dari candle harian tersimpan pada tanggal
+      jatuh tempo (toleransi 3 hari). Pemindaian yang horizonnya belum lewat tidak
+      dinilai — tidak ada penilaian prematur. Evaluasi ini menilai alatnya, bukan
+      menjanjikan hasil: kinerja masa lalu aplikasi sama tidak jaminannya dengan
+      kinerja masa lalu pasar.</p>
+  </div>
+</div>
+</body>
+</html>

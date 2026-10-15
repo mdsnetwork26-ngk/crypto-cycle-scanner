@@ -34,6 +34,23 @@ class Settings:
     database_path: str = os.getenv("DATABASE_PATH", "data/scanner.db")
     demo_mode: bool = _bool("DEMO_MODE", False)
     fetch_workers: int = max(1, _int("FETCH_WORKERS", 4))
+    # Jadwal pemindaian berkala (benang latar di dalam aplikasi).
+    schedule_enabled: bool = _bool("SCHEDULE_ENABLED", False)
+    schedule_hour: int = max(0, min(23, _int("SCHEDULE_HOUR", 6)))
+    schedule_minute: int = max(0, min(59, _int("SCHEDULE_MINUTE", 0)))
+    schedule_horizons_raw: str = os.getenv("SCHEDULED_HORIZONS", "7,30,365")
+
+    @property
+    def schedule_horizons(self) -> list[int]:
+        out: list[int] = []
+        for part in self.schedule_horizons_raw.split(","):
+            try:
+                v = int(part.strip())
+            except ValueError:
+                continue
+            if v in (7, 30, 365) and v not in out:
+                out.append(v)
+        return out or [30]
     reference_symbols_raw: str = os.getenv(
         "REFERENCE_SYMBOLS",
         "BTC,ETH,BNB,SOL,XRP,DOGE,ADA,TRX,LINK,LTC,"

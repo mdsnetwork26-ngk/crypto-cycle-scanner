@@ -53,7 +53,9 @@
     <h1>🔭 Crypto Cycle Scanner</h1>
     <p>Memindai koin Indodax yang fasenya mirip episode historis banyak koin —
        lalu melaporkan apa yang <em>nyata</em> terjadi pada episode-episode itu
-       {{ '30 hari' if horizon == 30 else '1 tahun' }} kemudian.</p>
+       {{ horizon_short }} kemudian.</p>
+    <p style="margin-top:6px"><a href="/evaluasi">📊 Evaluasi bulanan</a> — nilai kinerja
+       aplikasi dari pemindaian yang horizonnya sudah lewat.</p>
   </header>
 
   {% if demo %}
@@ -70,6 +72,7 @@
       <div>
         <label>Horizon potensi</label>
         <select name="horizon_days">
+          <option value="7" {{ 'selected' if horizon == 7 }}>1 minggu (7 hari)</option>
           <option value="30" {{ 'selected' if horizon == 30 }}>1 bulan (30 hari)</option>
           <option value="365" {{ 'selected' if horizon == 365 }}>1 tahun (365 hari)</option>
         </select>
@@ -90,6 +93,15 @@
       <button type="submit" {{ 'disabled' if running }}>🔄 Pindai sekarang</button>
       <span class="mut">Hasil terakhir: {{ scan.finished_at | tgl if scan else 'belum ada pemindaian' }}</span>
     </form>
+    {% if sched.enabled %}
+    <p class="mut" style="margin:10px 0 0">🗓️ Jadwal otomatis <strong>aktif</strong>: horizon
+      {{ sched.horizons | join(', ') }} hari dipindai tiap hari pukul {{ sched.time }} —
+      berikutnya {{ sched.next }}.</p>
+    {% else %}
+    <p class="mut" style="margin:10px 0 0">🗓️ Jadwal otomatis nonaktif. Aktifkan dengan
+      <code>SCHEDULE_ENABLED=1</code> di .env agar pemindaian harian terkumpul sebagai
+      bahan <a href="/evaluasi">evaluasi bulanan</a>.</p>
+    {% endif %}
     {% if running %}
     <div id="prog">
       <div class="mut" style="margin-top:10px">⏳ Pemindaian #{{ running.id }} berjalan —
@@ -113,8 +125,9 @@
 
   <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:18px 0 4px">
     <div class="seg">
-      <a href="/?horizon=30" class="{{ 'on' if horizon == 30 }}">Potensi 1 bulan</a>
-      <a href="/?horizon=365" class="{{ 'on' if horizon == 365 }}">Potensi 1 tahun</a>
+      {% for o in horizon_options %}
+      <a href="/?horizon={{ o.days }}" class="{{ 'on' if horizon == o.days }}">{{ o.label }}</a>
+      {% endfor %}
     </div>
     <form method="get" style="display:flex;gap:8px;flex-wrap:wrap">
       <input type="hidden" name="horizon" value="{{ horizon }}">
@@ -199,7 +212,7 @@
       <li><strong>Peluang naik &amp; median analog</strong> berasal dari episode
         historis nyata (banyak koin, banyak siklus — bukan hanya Solana 2022):
         keadaan koin hari ini dicocokkan dengan keadaan koin-koin di masa lalu,
-        lalu dilihat hasil nyatanya {{ '30 hari' if horizon == 30 else '1 tahun' }} sesudahnya.</li>
+        lalu dilihat hasil nyatanya {{ horizon_short }} sesudahnya.</li>
       <li><strong>Skenario P25–P75</strong> adalah rentang hasil tengah para analog —
         bukan target harga. Klik <em>detail</em> untuk melihat episode analognya satu per satu.</li>
     </ul>

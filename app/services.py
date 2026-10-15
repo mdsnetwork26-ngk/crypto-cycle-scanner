@@ -24,6 +24,13 @@ _running_thread: threading.Thread | None = None
 _STABLE = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "BUSD", "IDRT", "XAUT", "PAXG"}
 _LEVERAGED_HINTS = ("3L", "3S", "5L", "5S", "BULL", "BEAR")
 
+# Horizon yang didukung (hari): mingguan, bulanan, tahunan.
+HORIZONS = (7, 30, 365)
+# Ambang "naik besar" (%) dan skala median untuk skor, per horizon —
+# gerak 7 hari memang jauh lebih kecil daripada gerak 1 tahun.
+_BIG_PCT = {7: 5.0, 30: 10.0, 365: 20.0}
+_MEDIAN_SCALE = {7: 0.05, 30: 0.10, 365: 0.35}
+
 
 def _excluded(pair: dict, summary: dict) -> str | None:
     """Alasan koin dicoret dari peringkat (None = layak dianalisa)."""
@@ -104,7 +111,7 @@ def _aggregate(analogs: list[dict], horizon_days: int) -> dict:
     rets = np.array([a["forward_return_pct"] for a in analogs], dtype=float)
     dds = np.array([a["forward_drawdown_pct"] for a in analogs], dtype=float)
     w = np.array([a["similarity"] for a in analogs], dtype=float)
-    big = 10.0 if horizon_days <= 30 else 20.0
+    big = _BIG_PCT.get(horizon_days, 10.0)
     return {
         "probability_up": float(np.sum(w[rets > 0]) / np.sum(w) * 100) if np.sum(w) else 50.0,
         "probability_big": float(np.sum(w[rets > big]) / np.sum(w) * 100) if np.sum(w) else 0.0,
@@ -128,8 +135,8 @@ def _classify(score: float, agg: dict) -> str:
 def run_scan(horizon_days: int, max_coins: int = 60,
              min_volume_idr: float = 100_000_000, scan_id: int | None = None) -> int:
     """Jalankan satu pemindaian penuh (sinkron; pemanggil mengatur thread)."""
-    if horizon_days not in (30, 365):
-        raise ValueError("horizon hanya 30 (1 bulan) atau 365 (1 tahun)")
+    if horizon_days not in HORIZONS:
+        raise ValueError("horizon hanya 7 (1 minggu), 30 (1 bulan), atau 365 (1 tahun)")
     started = int(time.time())
     if scan_id is None:
         scan_id = db.create_scan(horizon_days, started)
@@ -258,7 +265,7 @@ def run_scan(horizon_days: int, max_coins: int = 60,
                 continue
             agg = _aggregate(analogs, horizon_days)
             trend = _trend_score(feat)
-            median_scale = 0.10 if horizon_days <= 30 else 0.35
+            median_scale = _MEDIAN_SCALE.get(horizon_days, 0.10)
             median_score = 50 + 38 * math.tanh(agg["median_pct"] / 100.0 / median_scale)
             penalty = 0.0
             vol_idr = summ.get("volume_idr", 0)

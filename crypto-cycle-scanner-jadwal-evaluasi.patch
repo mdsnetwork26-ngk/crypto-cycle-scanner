@@ -1,0 +1,977 @@
+diff --git a/.env.example b/.env.example
+index a7f0d42..e4df178 100644
+--- a/.env.example
++++ b/.env.example
+@@ -8,3 +8,9 @@ DEMO_MODE=false
+ REFERENCE_SYMBOLS=BTC,ETH,BNB,SOL,XRP,DOGE,ADA,TRX,LINK,LTC,DOT,AVAX,ATOM,NEAR,UNI,AAVE,FIL,ALGO,XLM,ETC
+ # Jumlah pekerja unduhan paralel ke Indodax (jangan besar-besar)
+ FETCH_WORKERS=4
++# Jadwal berkala: pindai SCHEDULED_HORIZONS tiap hari pukul
++# SCHEDULE_HOUR:SCHEDULE_MINUTE (WIB), memakai ambang bawaan tombol manual.
++SCHEDULE_ENABLED=false
++SCHEDULED_HORIZONS=7,30,365
++SCHEDULE_HOUR=6
++SCHEDULE_MINUTE=0
+diff --git a/README.md b/README.md
+index a7db0cf..a9e806d 100644
+--- a/README.md
++++ b/README.md
+@@ -46,7 +46,8 @@ DEMO_MODE=1 venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8020
+ venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8020
+ ```
+ 
+-Buka `http://localhost:8020`, pilih horizon, klik **Pindai sekarang**.
++Buka `http://localhost:8020`, pilih horizon (1 minggu / 1 bulan / 1 tahun),
++klik **Pindai sekarang**.
+ Pemindaian pertama mengambil candle ±3–10 tahun untuk koin acuan dan ±3 tahun
+ untuk kandidat (butuh beberapa menit); hasil & candle tersimpan di SQLite
+ (`data/scanner.db`) sehingga pemindaian berikutnya jauh lebih cepat.
+@@ -110,6 +111,32 @@ curl -X POST -d "horizon_days=30&max_coins=40&min_volume_idr=100000000" \
+   http://localhost:8020/scan/sync
+ ```
+ 
++## Pemindaian terjadwal & evaluasi bulanan
++
++Agar rekam jejak terbentuk tanpa klik manual, aktifkan penjadwal bawaan di
++`.env` server:
++
++```ini
++SCHEDULE_ENABLED=1
++SCHEDULED_HORIZONS=7,30,365
++SCHEDULE_HOUR=6
++SCHEDULE_MINUTE=0
++```
++
++Setiap hari pukul 06.00 WIB ketiga horizon dipindai bergantian (tidak akan
++bertabrakan dengan pemindaian manual). Setiap pemindaian tersimpan permanen
++di SQLite beserta tanggal, harga, dan skenarionya.
++
++Halaman **`/evaluasi`** membandingkan pemindaian lama dengan harga realisasi
++setelah horizonnya jatuh tempo: akurasi arah per kelas (Potensi Naik/Netral/
++Turun), cakupan rentang P25-P75, kekeliruan skenario median, kalibrasi
++probabilitas naik, uji peringkat skor, kinerja per koin, dan selisihnya
++**dibanding sekadar memegang BTC pada jendela waktu yang sama**. Buka halaman
++itu di akhir bulan untuk menilai bulan sebelumnya; tersedia juga tampilan
++kumulatif. Pemindaian yang horizonnya belum lewat tidak dinilai — tidak ada
++penilaian prematur — dan semua tabel menampilkan jumlah sampel (n) karena
++bulan-bulan awal datanya masih sedikit.
++
+ ## Tes
+ 
+ ```bash
+diff --git a/app/config.py b/app/config.py
+index df64a49..fdd2b02 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -34,6 +34,23 @@ class Settings:
+     database_path: str = os.getenv("DATABASE_PATH", "data/scanner.db")
+     demo_mode: bool = _bool("DEMO_MODE", False)
+     fetch_workers: int = max(1, _int("FETCH_WORKERS", 4))
++    # Jadwal pemindaian berkala (benang latar di dalam aplikasi).
++    schedule_enabled: bool = _bool("SCHEDULE_ENABLED", False)
++    schedule_hour: int = max(0, min(23, _int("SCHEDULE_HOUR", 6)))
++    schedule_minute: int = max(0, min(59, _int("SCHEDULE_MINUTE", 0)))
++    schedule_horizons_raw: str = os.getenv("SCHEDULED_HORIZONS", "7,30,365")
++
++    @property
++    def schedule_horizons(self) -> list[int]:
++        out: list[int] = []
++        for part in self.schedule_horizons_raw.split(","):
++            try:
++                v = int(part.strip())
++            except ValueError:
++                continue
++            if v in (7, 30, 365) and v not in out:
++                out.append(v)
++        return out or [30]
+     reference_symbols_raw: str = os.getenv(
+         "REFERENCE_SYMBOLS",
+         "BTC,ETH,BNB,SOL,XRP,DOGE,ADA,TRX,LINK,LTC,"
+diff --git a/app/db.py b/app/db.py
+index 708bcb1..ad0d440 100644
+--- a/app/db.py
++++ b/app/db.py
+@@ -183,6 +183,14 @@ class Database:
+                 "ORDER BY id DESC LIMIT 1", (horizon_days,)).fetchone()
+         return dict(row) if row else None
+ 
++    def scans_between(self, start_ts: int, end_ts: int) -> list[dict]:
++        """Pemindaian yang dimulai dalam rentang [start_ts, end_ts)."""
++        with self.connect() as c:
++            rows = c.execute(
++                "SELECT * FROM scans WHERE started_at>=? AND started_at<? "
++                "ORDER BY started_at", (int(start_ts), int(end_ts))).fetchall()
++        return [dict(r) for r in rows]
++
+     def list_scans(self, limit: int = 10) -> list[dict]:
+         with self.connect() as c:
+             rows = c.execute(
+diff --git a/app/evaluate.py b/app/evaluate.py
+new file mode 100644
+index 0000000..34b09e8
+--- /dev/null
++++ b/app/evaluate.py
+@@ -0,0 +1,269 @@
++"""Evaluasi hasil pemindaian terhadap harga realisasi.
++
++Setiap pemindaian menyimpan harga & skenario pada tanggalnya. Modul ini
++membandingkan ramalan lama itu dengan yang benar-benar terjadi setelah
++horizonnya lewat: arah kelasnya benar atau tidak, harga realisasi masuk
++rentang P25-P75 atau tidak, seberapa meleset skenario mediannya, dan
++bagaimana hasil peringkatnya dibanding sekadar memegang BTC pada
++jendela yang sama. Dihitung langsung dari basis data setiap halaman
++dibuka, jadi angka "matang" bertambah sendiri seiring waktu.
++
++Catatan kejujuran: bulan-bulan awal jumlah sampelnya kecil. Semua tabel
++menampilkan n supaya tidak ada kesimpulan yang terasa lebih pasti
++daripada data yang sebenarnya.
++"""
++from __future__ import annotations
++
++import calendar
++from datetime import datetime, timedelta, timezone
++
++import numpy as np
++
++from .db import Database
++
++WIB = timezone(timedelta(hours=7))
++_BIG_PCT = {7: 5.0, 30: 10.0, 365: 20.0}
++_CLASSES = ("Potensi Naik", "Netral / Menunggu", "Potensi Turun")
++
++
++def _close_at_or_before(candles: list[dict], ts: int) -> float | None:
++    best = None
++    for c in candles:
++        if c["ts"] <= ts:
++            best = float(c["close"])
++        else:
++            break
++    return best
++
++
++def _close_at_or_after(candles: list[dict], ts: int,
++                       tolerance_days: int = 3) -> float | None:
++    for c in candles:
++        if c["ts"] >= ts:
++            if c["ts"] > ts + tolerance_days * 86400:
++                return None
++            return float(c["close"])
++    return None
++
++
++def _realized_pct(db: Database, pair_id: str, as_of_ts: int,
++                  price0: float, horizon_days: int) -> float | None:
++    """Perubahan % harga `horizon_days` setelah as_of (None = belum matang)."""
++    if not price0 or price0 <= 0:
++        return None
++    candles = db.candles(pair_id)
++    if not candles:
++        return None
++    close = _close_at_or_after(candles, as_of_ts + horizon_days * 86400)
++    if close is None:
++        return None
++    return (close / float(price0) - 1.0) * 100.0
++
++
++def _btc_realized_pct(db: Database, as_of_ts: int, horizon_days: int,
++                      cache: dict) -> float | None:
++    if "pair_id" not in cache:
++        cache["pair_id"] = next(
++            (p["pair_id"] for p in db.pairs() if (p.get("symbol") or "") == "BTC"),
++            "btc_idr")
++        cache["candles"] = db.candles(cache["pair_id"])
++    candles = cache["candles"]
++    if not candles:
++        return None
++    p0 = _close_at_or_before(candles, as_of_ts)
++    p1 = _close_at_or_after(candles, as_of_ts + horizon_days * 86400)
++    if not p0 or not p1:
++        return None
++    return (p1 / p0 - 1.0) * 100.0
++
++
++def scan_outcomes(db: Database, scan: dict, btc_cache: dict) -> list[dict]:
++    """Hasil per koin dari satu pemindaian, ditambah realisasinya."""
++    horizon = int(scan["horizon_days"])
++    out: list[dict] = []
++    for payload in db.results(scan["id"]):
++        realized = _realized_pct(db, payload["pair_id"], int(payload["as_of_ts"]),
++                                 float(payload["price"]), horizon)
++        out.append({
++            "symbol": payload.get("symbol", ""),
++            "pair_id": payload["pair_id"],
++            "classification": payload.get("classification", ""),
++            "score": float(payload.get("score", 0)),
++            "probability_up": float(payload.get("probability_up", 0)),
++            "median_pct": float(payload.get("median_pct", 0)),
++            "p25_pct": float(payload.get("p25_pct", 0)),
++            "p75_pct": float(payload.get("p75_pct", 0)),
++            "realized_pct": realized,
++            "matured": realized is not None,
++            "btc_pct": (_btc_realized_pct(db, int(payload["as_of_ts"]), horizon,
++                                          btc_cache) if realized is not None else None),
++        })
++    return out
++
++
++def _arah_benar(o: dict, horizon: int) -> bool:
++    r = o["realized_pct"]
++    if o["classification"] == "Potensi Naik":
++        return r > 0
++    if o["classification"] == "Potensi Turun":
++        return r < 0
++    return abs(r) <= _BIG_PCT.get(horizon, 10.0)
++
++
++def _summarize(outcomes: list[dict], horizon: int) -> dict:
++    matang = [o for o in outcomes if o["matured"]]
++    s: dict = {
++        "n_total": len(outcomes),
++        "n_matured": len(matang),
++        "n_pending": len(outcomes) - len(matang),
++        "classes": [],
++        "calibration": [],
++        "band_pct": None,
++        "median_error": None,
++        "avg_realized": None,
++        "avg_btc": None,
++        "top_bottom": None,
++        "coins_best": [],
++        "coins_worst": [],
++        "notes": [],
++    }
++    if not matang:
++        return s
++    r_all = np.array([o["realized_pct"] for o in matang], dtype=float)
++    s["avg_realized"] = float(np.mean(r_all))
++    btc = [o["btc_pct"] for o in matang if o["btc_pct"] is not None]
++    s["avg_btc"] = float(np.mean(btc)) if btc else None
++    s["median_error"] = float(np.median(
++        [o["realized_pct"] - o["median_pct"] for o in matang]))
++    band = [o for o in matang if o["p25_pct"] <= o["realized_pct"] <= o["p75_pct"]]
++    s["band_pct"] = len(band) / len(matang) * 100.0
++
++    for cls in _CLASSES:
++        group = [o for o in matang if o["classification"] == cls]
++        if not group:
++            s["classes"].append({"name": cls, "n": 0, "hit_pct": None,
++                                 "avg": None, "avg_btc": None, "excess": None})
++            continue
++        hit = np.mean([_arah_benar(o, horizon) for o in group]) * 100.0
++        avg = float(np.mean([o["realized_pct"] for o in group]))
++        gb = [o["btc_pct"] for o in group if o["btc_pct"] is not None]
++        avg_btc = float(np.mean(gb)) if gb else None
++        s["classes"].append({
++            "name": cls, "n": len(group), "hit_pct": float(hit), "avg": avg,
++            "avg_btc": avg_btc,
++            "excess": (avg - avg_btc) if avg_btc is not None else None,
++        })
++
++    for lo, hi in ((0, 40), (40, 55), (55, 70), (70, 100.01)):
++        group = [o for o in matang if lo <= o["probability_up"] < hi]
++        if group:
++            s["calibration"].append({
++                "label": f"{lo:.0f}-{min(hi, 100):.0f}%",
++                "n": len(group),
++                "up_pct": float(np.mean([o["realized_pct"] > 0 for o in group]) * 100.0),
++            })
++
++    ranked = sorted(matang, key=lambda o: o["score"], reverse=True)
++    if len(ranked) >= 6:
++        top = ranked[:5]
++        bottom = ranked[-5:]
++        s["top_bottom"] = {
++            "top_avg": float(np.mean([o["realized_pct"] for o in top])),
++            "bottom_avg": float(np.mean([o["realized_pct"] for o in bottom])),
++            "top_symbols": ", ".join(o["symbol"] for o in top),
++            "bottom_symbols": ", ".join(o["symbol"] for o in bottom),
++        }
++
++    per_coin: dict[str, list[dict]] = {}
++    for o in matang:
++        per_coin.setdefault(o["symbol"], []).append(o)
++    coin_rows = []
++    for symbol, group in per_coin.items():
++        if len(group) >= 2:
++            coin_rows.append({
++                "symbol": symbol, "n": len(group),
++                "avg": float(np.mean([o["realized_pct"] for o in group])),
++                "hit_pct": float(np.mean([_arah_benar(o, horizon) for o in group]) * 100.0),
++            })
++    coin_rows.sort(key=lambda c: c["avg"], reverse=True)
++    s["coins_best"] = coin_rows[:5]
++    s["coins_worst"] = list(reversed(coin_rows[-5:])) if len(coin_rows) > 5 else []
++
++    # Catatan pola sederhana, selalu menyebut jumlah sampelnya.
++    for row in s["classes"]:
++        if row["n"] >= 5 and row["hit_pct"] is not None:
++            if row["hit_pct"] >= 70:
++                s["notes"].append(
++                    f"Kelas {row['name']} cukup bisa diandalkan sejauh ini: "
++                    f"{row['hit_pct']:.0f}% arahnya benar dari {row['n']} sampel.")
++            elif row["hit_pct"] <= 35:
++                s["notes"].append(
++                    f"Kelas {row['name']} justru sering meleset "
++                    f"({row['hit_pct']:.0f}% benar dari {row['n']} sampel) — "
++                    "pola kontrarian yang layak diawasi, bukan dibalik membabi buta.")
++    if s["band_pct"] is not None and len(matang) >= 8:
++        if s["band_pct"] < 35:
++            s["notes"].append(
++                "Harga realisasi sering keluar dari rentang P25-P75: rentang "
++                "skenario aplikasi terlalu sempit untuk volatilitas nyata.")
++        elif s["band_pct"] > 75:
++            s["notes"].append(
++                "Harga realisasi hampir selalu di dalam rentang P25-P75: "
++                "rentangnya cenderung terlalu lebar untuk jadi pembeda.")
++    if s["top_bottom"] and len(matang) >= 10:
++        tb = s["top_bottom"]
++        if tb["top_avg"] > tb["bottom_avg"]:
++            s["notes"].append(
++                f"Peringkat bekerja bulan ini: 5 skor teratas rata-rata "
++                f"{tb['top_avg']:+.1f}% vs 5 terbawah {tb['bottom_avg']:+.1f}%.")
++        else:
++            s["notes"].append(
++                "Peringkat belum bekerja bulan ini: skor teratas tidak "
++                "mengalahkan skor terbawah.")
++    return s
++
++
++def available_months(db: Database) -> list[dict]:
++    """Bulan-bulan (WIB) yang memiliki pemindaian selesai, terbaru dulu."""
++    seen: dict[tuple[int, int], None] = {}
++    for scan in db.list_scans(10000):
++        if scan["status"] != "done":
++            continue
++        dt = datetime.fromtimestamp(int(scan["started_at"]), WIB)
++        seen.setdefault((dt.year, dt.month), None)
++    return [{"year": y, "month": m,
++             "label": datetime(y, m, 1, tzinfo=WIB).strftime("%B %Y")}
++            for (y, m) in sorted(seen, reverse=True)]
++
++
++def monthly_report(db: Database, year: int | None = None,
++                   month: int | None = None) -> dict:
++    """Laporan satu bulan (atau kumulatif bila year=None)."""
++    now = datetime.now(WIB)
++    cumulative = year is None or month is None
++    if cumulative:
++        start_ts, end_ts = 0, int(now.timestamp()) + 1
++        label = "Kumulatif (semua waktu)"
++    else:
++        start = datetime(year, month, 1, tzinfo=WIB)
++        end = start + timedelta(days=calendar.monthrange(year, month)[1])
++        start_ts, end_ts = int(start.timestamp()), int(end.timestamp())
++        label = start.strftime("%B %Y")
++
++    scans = [s for s in db.scans_between(start_ts, end_ts) if s["status"] == "done"]
++    btc_cache: dict = {}
++    per_horizon: dict[int, list[dict]] = {}
++    for scan in scans:
++        horizon = int(scan["horizon_days"])
++        per_horizon.setdefault(horizon, []).extend(
++            scan_outcomes(db, scan, btc_cache))
++
++    return {
++        "label": label,
++        "cumulative": cumulative,
++        "year": year, "month": month,
++        "n_scans": len(scans),
++        "horizons": {h: _summarize(outs, h) for h, outs in sorted(per_horizon.items())},
++        "months": available_months(db),
++        "generated_at": now.strftime("%d %b %Y %H:%M WIB"),
++    }
+diff --git a/app/main.py b/app/main.py
+index 2c277b4..c82592d 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -16,15 +16,24 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+ from fastapi.templating import Jinja2Templates
+ 
+ from .config import settings
+-from .services import db, run_scan, start_scan
++from .evaluate import available_months, monthly_report
++from .scheduler import schedule_info, start_scheduler
++from .services import HORIZONS, db, run_scan, start_scan
+ 
+ WIB = timezone(timedelta(hours=7))
+ BASE_DIR = Path(__file__).resolve().parent.parent
+ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+ 
++HORIZON_LABELS = {7: "Potensi 1 minggu", 30: "Potensi 1 bulan", 365: "Potensi 1 tahun"}
++
+ app = FastAPI(title="Crypto Cycle Scanner")
+ 
+ 
++@app.on_event("startup")
++def _mulai_penjadwal() -> None:
++    start_scheduler()
++
++
+ def fmt_idr(value) -> str:
+     try:
+         v = float(value)
+@@ -85,7 +94,7 @@ def health():
+ def dashboard(request: Request, horizon: int = Query(30),
+               q: str = Query(""), kelas: str = Query(""),
+               scan_id: int | None = Query(None)):
+-    if horizon not in (30, 365):
++    if horizon not in HORIZONS:
+         horizon = 30
+     scan = db.latest_done_scan(horizon) if scan_id is None else db.get_scan(scan_id)
+     results = db.scan_results(scan["id"]) if scan else []
+@@ -107,6 +116,10 @@ def dashboard(request: Request, horizon: int = Query(30),
+             "running": running if running and running["status"] == "running" else None,
+             "classes": ["Potensi Naik", "Netral / Menunggu", "Potensi Turun"],
+             "demo": settings.demo_mode,
++            "horizon_options": [
++                {"days": h, "label": HORIZON_LABELS[h]} for h in sorted(HORIZONS)],
++            "horizon_short": HORIZON_LABELS[horizon].replace("Potensi ", ""),
++            "sched": schedule_info(),
+         },
+     )
+ 
+@@ -114,7 +127,7 @@ def dashboard(request: Request, horizon: int = Query(30),
+ @app.post("/scan")
+ def trigger_scan(horizon_days: int = Form(...), max_coins: int = Form(40),
+                  min_volume_idr: float = Form(100_000_000)):
+-    if horizon_days not in (30, 365):
++    if horizon_days not in HORIZONS:
+         horizon_days = 30
+     max_coins = max(5, min(120, int(max_coins)))
+     scan_id = start_scan(horizon_days, max_coins, float(min_volume_idr))
+@@ -129,6 +142,30 @@ def trigger_scan_sync(horizon_days: int = Form(...), max_coins: int = Form(40),
+     return RedirectResponse(f"/?horizon={horizon_days}", status_code=303)
+ 
+ 
++@app.get("/evaluasi", response_class=HTMLResponse)
++def evaluasi(request: Request, year: int | None = Query(None),
++             month: int | None = Query(None)):
++    months = available_months(db)
++    now = datetime.now(WIB)
++    if year is not None and year == 0:
++        report = monthly_report(db)
++        selected = "semua"
++    elif year and month and 1 <= month <= 12:
++        report = monthly_report(db, year, month)
++        selected = f"{year}-{month}"
++    else:
++        prev = (now.year - 1, 12) if now.month == 1 else (now.year, now.month - 1)
++        keys = {(m["year"], m["month"]) for m in months}
++        chosen = prev if prev in keys else (now.year, now.month)
++        report = monthly_report(db, chosen[0], chosen[1])
++        selected = f"{chosen[0]}-{chosen[1]}"
++    return templates.TemplateResponse(
++        request, "evaluasi.html",
++        {"report": report, "months": months, "selected": selected,
++         "demo": settings.demo_mode, "horizon_labels": HORIZON_LABELS},
++    )
++
++
+ @app.get("/api/scan/status")
+ def scan_status(scan_id: int | None = Query(None)):
+     scan = db.get_scan(scan_id) if scan_id else db.latest_scan()
+@@ -156,7 +193,7 @@ def coin_detail(request: Request, pair_id: str,
+                 scan_id: int | None = Query(None),
+                 horizon: int = Query(30)):
+     if scan_id is None:
+-        scan = db.latest_done_scan(horizon if horizon in (30, 365) else 30)
++        scan = db.latest_done_scan(horizon if horizon in HORIZONS else 30)
+     else:
+         scan = db.get_scan(scan_id)
+     result = db.result_for_pair(scan["id"], pair_id) if scan else None
+diff --git a/app/scheduler.py b/app/scheduler.py
+new file mode 100644
+index 0000000..a7468ed
+--- /dev/null
++++ b/app/scheduler.py
+@@ -0,0 +1,87 @@
++"""Penjadwal pemindaian berkala (benang latar di dalam aplikasi).
++
++Aktif bila SCHEDULE_ENABLED=1. Setiap hari pada jam SCHEDULE_HOUR:
++SCHEDULE_MINUTE (WIB), semua horizon di SCHEDULED_HORIZONS dipindai
++bergantian memakai jalur yang sama dengan tombol manual (start_scan),
++jadi tidak akan bertabrakan dengan pemindaian yang sedang berjalan.
++
++Keputusan "sudah waktunya" murni fungsi dari jam jadwal hari ini dan
++waktu mulai pemindaian terakhir per horizon di basis data — sehingga
++aman dari duplikasi setelah aplikasi/server direstart: bila jam jadwal
++sudah lewat tetapi hari ini belum ada pemindaian, ia langsung menyusul.
++"""
++from __future__ import annotations
++
++import threading
++from datetime import datetime, timedelta, timezone
++
++from .config import settings
++from .services import db, start_scan
++
++WIB = timezone(timedelta(hours=7))
++
++_thread: threading.Thread | None = None
++_stop = threading.Event()
++
++
++def _today_schedule(now: datetime) -> datetime:
++    return now.replace(hour=settings.schedule_hour,
++                       minute=settings.schedule_minute,
++                       second=0, microsecond=0)
++
++
++def due_horizons(now: datetime, last_started: dict[int, int]) -> list[int]:
++    """Horizon yang sudah melewati jam jadwal hari ini & belum dipindai."""
++    if now < _today_schedule(now):
++        return []
++    sched_ts = int(_today_schedule(now).timestamp())
++    return [h for h in settings.schedule_horizons
++            if int(last_started.get(h, 0)) < sched_ts]
++
++
++def next_run(now: datetime) -> datetime:
++    """Waktu jadwal berikutnya (hari ini bila belum lewat, else besok)."""
++    t = _today_schedule(now)
++    return t if now < t else t + timedelta(days=1)
++
++
++def _last_started_map() -> dict[int, int]:
++    out: dict[int, int] = {}
++    for h in settings.schedule_horizons:
++        scan = db.latest_scan(h)
++        out[h] = int(scan["started_at"]) if scan else 0
++    return out
++
++
++def _loop() -> None:
++    while not _stop.wait(30):
++        if not settings.schedule_enabled:
++            continue
++        try:
++            for horizon in due_horizons(datetime.now(WIB), _last_started_map()):
++                start_scan(horizon)  # None (diabaikan) bila ada yang berjalan
++        except Exception:  # noqa: BLE001 - penjadwal tidak boleh mematikan app
++            continue
++
++
++def start_scheduler() -> threading.Thread | None:
++    global _thread
++    if not settings.schedule_enabled:
++        return None
++    if _thread is not None and _thread.is_alive():
++        return _thread
++    _stop.clear()
++    _thread = threading.Thread(target=_loop, daemon=True, name="penjadwal-pindai")
++    _thread.start()
++    return _thread
++
++
++def schedule_info() -> dict:
++    """Ringkasan jadwal untuk ditampilkan di dasbor."""
++    now = datetime.now(WIB)
++    return {
++        "enabled": settings.schedule_enabled,
++        "horizons": settings.schedule_horizons,
++        "time": f"{settings.schedule_hour:02d}:{settings.schedule_minute:02d} WIB",
++        "next": next_run(now).strftime("%d %b %Y %H:%M WIB"),
++    }
+diff --git a/app/services.py b/app/services.py
+index bfaa480..b905a05 100644
+--- a/app/services.py
++++ b/app/services.py
+@@ -24,6 +24,13 @@ _running_thread: threading.Thread | None = None
+ _STABLE = {"USDT", "USDC", "DAI", "FDUSD", "TUSD", "BUSD", "IDRT", "XAUT", "PAXG"}
+ _LEVERAGED_HINTS = ("3L", "3S", "5L", "5S", "BULL", "BEAR")
+ 
++# Horizon yang didukung (hari): mingguan, bulanan, tahunan.
++HORIZONS = (7, 30, 365)
++# Ambang "naik besar" (%) dan skala median untuk skor, per horizon —
++# gerak 7 hari memang jauh lebih kecil daripada gerak 1 tahun.
++_BIG_PCT = {7: 5.0, 30: 10.0, 365: 20.0}
++_MEDIAN_SCALE = {7: 0.05, 30: 0.10, 365: 0.35}
++
+ 
+ def _excluded(pair: dict, summary: dict) -> str | None:
+     """Alasan koin dicoret dari peringkat (None = layak dianalisa)."""
+@@ -104,7 +111,7 @@ def _aggregate(analogs: list[dict], horizon_days: int) -> dict:
+     rets = np.array([a["forward_return_pct"] for a in analogs], dtype=float)
+     dds = np.array([a["forward_drawdown_pct"] for a in analogs], dtype=float)
+     w = np.array([a["similarity"] for a in analogs], dtype=float)
+-    big = 10.0 if horizon_days <= 30 else 20.0
++    big = _BIG_PCT.get(horizon_days, 10.0)
+     return {
+         "probability_up": float(np.sum(w[rets > 0]) / np.sum(w) * 100) if np.sum(w) else 50.0,
+         "probability_big": float(np.sum(w[rets > big]) / np.sum(w) * 100) if np.sum(w) else 0.0,
+@@ -128,8 +135,8 @@ def _classify(score: float, agg: dict) -> str:
+ def run_scan(horizon_days: int, max_coins: int = 60,
+              min_volume_idr: float = 100_000_000, scan_id: int | None = None) -> int:
+     """Jalankan satu pemindaian penuh (sinkron; pemanggil mengatur thread)."""
+-    if horizon_days not in (30, 365):
+-        raise ValueError("horizon hanya 30 (1 bulan) atau 365 (1 tahun)")
++    if horizon_days not in HORIZONS:
++        raise ValueError("horizon hanya 7 (1 minggu), 30 (1 bulan), atau 365 (1 tahun)")
+     started = int(time.time())
+     if scan_id is None:
+         scan_id = db.create_scan(horizon_days, started)
+@@ -258,7 +265,7 @@ def run_scan(horizon_days: int, max_coins: int = 60,
+                 continue
+             agg = _aggregate(analogs, horizon_days)
+             trend = _trend_score(feat)
+-            median_scale = 0.10 if horizon_days <= 30 else 0.35
++            median_scale = _MEDIAN_SCALE.get(horizon_days, 0.10)
+             median_score = 50 + 38 * math.tanh(agg["median_pct"] / 100.0 / median_scale)
+             penalty = 0.0
+             vol_idr = summ.get("volume_idr", 0)
+diff --git a/templates/dashboard.html b/templates/dashboard.html
+index fced0fe..60e92c2 100644
+--- a/templates/dashboard.html
++++ b/templates/dashboard.html
+@@ -53,7 +53,9 @@
+     <h1>🔭 Crypto Cycle Scanner</h1>
+     <p>Memindai koin Indodax yang fasenya mirip episode historis banyak koin —
+        lalu melaporkan apa yang <em>nyata</em> terjadi pada episode-episode itu
+-       {{ '30 hari' if horizon == 30 else '1 tahun' }} kemudian.</p>
++       {{ horizon_short }} kemudian.</p>
++    <p style="margin-top:6px"><a href="/evaluasi">📊 Evaluasi bulanan</a> — nilai kinerja
++       aplikasi dari pemindaian yang horizonnya sudah lewat.</p>
+   </header>
+ 
+   {% if demo %}
+@@ -70,6 +72,7 @@
+       <div>
+         <label>Horizon potensi</label>
+         <select name="horizon_days">
++          <option value="7" {{ 'selected' if horizon == 7 }}>1 minggu (7 hari)</option>
+           <option value="30" {{ 'selected' if horizon == 30 }}>1 bulan (30 hari)</option>
+           <option value="365" {{ 'selected' if horizon == 365 }}>1 tahun (365 hari)</option>
+         </select>
+@@ -90,6 +93,15 @@
+       <button type="submit" {{ 'disabled' if running }}>🔄 Pindai sekarang</button>
+       <span class="mut">Hasil terakhir: {{ scan.finished_at | tgl if scan else 'belum ada pemindaian' }}</span>
+     </form>
++    {% if sched.enabled %}
++    <p class="mut" style="margin:10px 0 0">🗓️ Jadwal otomatis <strong>aktif</strong>: horizon
++      {{ sched.horizons | join(', ') }} hari dipindai tiap hari pukul {{ sched.time }} —
++      berikutnya {{ sched.next }}.</p>
++    {% else %}
++    <p class="mut" style="margin:10px 0 0">🗓️ Jadwal otomatis nonaktif. Aktifkan dengan
++      <code>SCHEDULE_ENABLED=1</code> di .env agar pemindaian harian terkumpul sebagai
++      bahan <a href="/evaluasi">evaluasi bulanan</a>.</p>
++    {% endif %}
+     {% if running %}
+     <div id="prog">
+       <div class="mut" style="margin-top:10px">⏳ Pemindaian #{{ running.id }} berjalan —
+@@ -113,8 +125,9 @@
+ 
+   <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:18px 0 4px">
+     <div class="seg">
+-      <a href="/?horizon=30" class="{{ 'on' if horizon == 30 }}">Potensi 1 bulan</a>
+-      <a href="/?horizon=365" class="{{ 'on' if horizon == 365 }}">Potensi 1 tahun</a>
++      {% for o in horizon_options %}
++      <a href="/?horizon={{ o.days }}" class="{{ 'on' if horizon == o.days }}">{{ o.label }}</a>
++      {% endfor %}
+     </div>
+     <form method="get" style="display:flex;gap:8px;flex-wrap:wrap">
+       <input type="hidden" name="horizon" value="{{ horizon }}">
+@@ -199,7 +212,7 @@
+       <li><strong>Peluang naik &amp; median analog</strong> berasal dari episode
+         historis nyata (banyak koin, banyak siklus — bukan hanya Solana 2022):
+         keadaan koin hari ini dicocokkan dengan keadaan koin-koin di masa lalu,
+-        lalu dilihat hasil nyatanya {{ '30 hari' if horizon == 30 else '1 tahun' }} sesudahnya.</li>
++        lalu dilihat hasil nyatanya {{ horizon_short }} sesudahnya.</li>
+       <li><strong>Skenario P25–P75</strong> adalah rentang hasil tengah para analog —
+         bukan target harga. Klik <em>detail</em> untuk melihat episode analognya satu per satu.</li>
+     </ul>
+diff --git a/templates/evaluasi.html b/templates/evaluasi.html
+new file mode 100644
+index 0000000..5b0020e
+--- /dev/null
++++ b/templates/evaluasi.html
+@@ -0,0 +1,178 @@
++<!doctype html>
++<html lang="id">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>Evaluasi Bulanan — Crypto Cycle Scanner</title>
++<style>
++  :root{--bg:#0b1220;--card:#131c2e;--line:#24314d;--txt:#e8eef9;--mut:#93a4c3;
++        --up:#2fbf71;--down:#e5534b;--mid:#e8b93e;--accent:#4f8cff}
++  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--txt);
++    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
++  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
++  .wrap{max-width:1000px;margin:0 auto;padding:20px 16px 60px}
++  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
++    padding:16px;margin:14px 0}
++  .warn{background:#2a2113;border:1px solid #6b5518;color:#f3d98b;border-radius:10px;
++    padding:10px 14px;font-size:13px;margin:14px 0}
++  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
++  .stat{background:#0d1626;border:1px solid var(--line);border-radius:10px;padding:12px}
++  .stat .v{font-size:19px;font-weight:800} .stat .k{color:var(--mut);font-size:12px}
++  table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:6px}
++  th,td{padding:8px;border-bottom:1px solid var(--line);text-align:right}
++  th{color:var(--mut);font-size:12px;text-transform:uppercase} td.l,th.l{text-align:left}
++  .pos{color:var(--up)} .neg{color:var(--down)} .mut{color:var(--mut);font-size:12.5px}
++  select,button{background:#0d1626;color:var(--txt);border:1px solid var(--line);
++    border-radius:8px;padding:9px 10px;font-size:14px}
++  button{background:var(--accent);color:#fff;border:0;cursor:pointer;font-weight:600}
++  h1{margin:4px 0} h2{margin:8px 0 4px} h3{margin:14px 0 4px}
++  ul{line-height:1.7;font-size:13.5px}
++  .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:700}
++  .b-up{background:rgba(47,191,113,.16);color:var(--up)}
++  .b-down{background:rgba(229,83,75,.16);color:var(--down)}
++  .b-mid{background:rgba(232,185,62,.16);color:var(--mid)}
++</style>
++</head>
++<body>
++<div class="wrap">
++  <p><a href="/">← kembali ke dasbor</a></p>
++  <h1>📊 Evaluasi hasil pemindaian</h1>
++  <p class="mut">Membandingkan kelas &amp; skenario yang dikeluarkan aplikasi dengan
++     harga yang benar-benar terjadi setelah horizonnya lewat. Dibuat {{ report.generated_at }} ·
++     {{ report.n_scans }} pemindaian selesai pada periode ini.</p>
++  {% if demo %}<p class="badge b-mid">MODE DEMO — data sintetis</p>{% endif %}
++
++  <form method="get" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0">
++    <label for="periode">Periode:</label>
++    <select name="periode" id="periode" onchange="pilihPeriode(this)">
++      {% for m in months %}
++      <option value="{{ m.year }}-{{ m.month }}" {{ 'selected' if selected == (m.year ~ '-' ~ m.month) }}>{{ m.label }}</option>
++      {% endfor %}
++      <option value="semua" {{ 'selected' if selected == 'semua' }}>Kumulatif (semua waktu)</option>
++    </select>
++    <span class="mut">Menampilkan: <strong>{{ report.label }}</strong></span>
++  </form>
++  <script>
++    function pilihPeriode(el) {
++      if (el.value === 'semua') { location = '/evaluasi?year=0'; return; }
++      const [y, m] = el.value.split('-');
++      location = `/evaluasi?year=${y}&month=${m}`;
++    }
++  </script>
++
++  {% if report.n_scans == 0 %}
++  <div class="card">Belum ada pemindaian selesai pada periode ini. Jalankan pemindaian
++    dari dasbor — evaluasi akan terisi sendiri setelah horizon pemindaian pertama
++    jatuh tempo (7/30/365 hari).</div>
++  {% endif %}
++
++  {% for horizon, s in report.horizons.items() %}
++  <div class="card">
++    <h2>Horizon {{ horizon }} hari — {{ horizon_labels[horizon] }}</h2>
++    {% if s.n_matured == 0 %}
++    <p class="mut">{{ s.n_total }} hasil tercatat, semuanya belum jatuh tempo.
++      Bagian ini terisi setelah {{ horizon }} hari sejak pemindaian.</p>
++    {% else %}
++    <div class="grid">
++      <div class="stat"><div class="k">Sampel dinilai (matang)</div>
++        <div class="v">{{ s.n_matured }}</div>
++        <div class="k">{{ s.n_pending }} menunggu jatuh tempo</div></div>
++      <div class="stat"><div class="k">Rata-rata realisasi</div>
++        <div class="v {{ 'pos' if s.avg_realized >= 0 else 'neg' }}">{{ s.avg_realized | pct }}</div></div>
++      <div class="stat"><div class="k">Rata-rata BTC (jendela sama)</div>
++        <div class="v">{{ s.avg_btc | pct if s.avg_btc is not none else '—' }}</div></div>
++      <div class="stat"><div class="k">Realisasi masuk rentang P25–P75</div>
++        <div class="v">{{ s.band_pct | pct(False) if s.band_pct is not none else '—' }}</div>
++        <div class="k">ideal kasar ±50%</div></div>
++      <div class="stat"><div class="k">Kekeliruan median (realisasi − skenario)</div>
++        <div class="v">{{ s.median_error | pct if s.median_error is not none else '—' }}</div></div>
++    </div>
++
++    {% if s.n_matured < 20 %}
++    <div class="warn">⚠️ Sampel masih sangat kecil ({{ s.n_matured }}). Angka di bawah ini
++      petunjuk awal, <strong>bukan kesimpulan</strong> — pola yang bisa dipercaya butuh
++      puluhan sampai ratusan sampel per kelas.</div>
++    {% endif %}
++
++    <h3>Kinerja per kelas</h3>
++    <table>
++      <thead><tr><th class="l">Kelas aplikasi</th><th>n</th><th>Arah benar</th>
++        <th>Rata-rata realisasi</th><th>BTC (jendela sama)</th><th>Selisih vs BTC</th></tr></thead>
++      <tbody>
++      {% for c in s.classes %}
++        <tr><td class="l">{% if c.name == 'Potensi Naik' %}<span class="badge b-up">▲ Potensi Naik</span>
++          {% elif c.name == 'Potensi Turun' %}<span class="badge b-down">▼ Potensi Turun</span>
++          {% else %}<span class="badge b-mid">➖ Netral / Menunggu</span>{% endif %}</td>
++          <td>{{ c.n }}</td>
++          <td>{{ (c.hit_pct | pct(False)) if c.hit_pct is not none else '—' }}</td>
++          <td class="{{ 'pos' if c.avg and c.avg >= 0 else 'neg' }}">{{ c.avg | pct if c.avg is not none else '—' }}</td>
++          <td>{{ c.avg_btc | pct if c.avg_btc is not none else '—' }}</td>
++          <td class="{{ 'pos' if c.excess and c.excess >= 0 else 'neg' }}">{{ c.excess | pct if c.excess is not none else '—' }}</td></tr>
++      {% endfor %}
++      </tbody>
++    </table>
++    <p class="mut">Untuk kelas Naik, "arah benar" = harga benar-benar naik; Turun = benar-benar turun;
++      Netral = bergerak di dalam ambang wajar horizon ini. Selisih vs BTC menjawab pertanyaan
++      terpenting: lebih baik daripada sekadar memegang Bitcoin atau tidak.</p>
++
++    {% if s.calibration %}
++    <h3>Kalibrasi probabilitas naik</h3>
++    <table>
++      <thead><tr><th class="l">Peluang naik menurut aplikasi</th><th>n</th><th>Benar-benar naik</th></tr></thead>
++      <tbody>
++      {% for k in s.calibration %}
++        <tr><td class="l">{{ k.label }}</td><td>{{ k.n }}</td><td>{{ k.up_pct | pct(False) }}</td></tr>
++      {% endfor %}
++      </tbody>
++    </table>
++    <p class="mut">Aplikasi yang terkalibrasi baik: baris 55–70% benar-benar naik sekitar 55–70%.</p>
++    {% endif %}
++
++    {% if s.top_bottom %}
++    <h3>Uji peringkat (skor)</h3>
++    <p>5 skor teratas rata-rata <strong class="{{ 'pos' if s.top_bottom.top_avg >= 0 else 'neg' }}">{{ s.top_bottom.top_avg | pct }}</strong>
++       ({{ s.top_bottom.top_symbols }}) vs 5 terbawah
++       <strong class="{{ 'pos' if s.top_bottom.bottom_avg >= 0 else 'neg' }}">{{ s.top_bottom.bottom_avg | pct }}</strong>
++       ({{ s.top_bottom.bottom_symbols }}).</p>
++    {% endif %}
++
++    {% if s.coins_best %}
++    <h3>Pola per koin (muncul ≥2× pada periode ini)</h3>
++    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px">
++      <table>
++        <thead><tr><th class="l">Realisasi terbaik</th><th>n</th><th>Rata-rata</th><th>Arah benar</th></tr></thead>
++        <tbody>{% for c in s.coins_best %}
++          <tr><td class="l"><strong>{{ c.symbol }}</strong></td><td>{{ c.n }}</td>
++            <td class="pos">{{ c.avg | pct }}</td><td>{{ c.hit_pct | pct(False) }}</td></tr>{% endfor %}
++        </tbody>
++      </table>
++      {% if s.coins_worst %}
++      <table>
++        <thead><tr><th class="l">Realisasi terburuk</th><th>n</th><th>Rata-rata</th><th>Arah benar</th></tr></thead>
++        <tbody>{% for c in s.coins_worst %}
++          <tr><td class="l"><strong>{{ c.symbol }}</strong></td><td>{{ c.n }}</td>
++            <td class="neg">{{ c.avg | pct }}</td><td>{{ c.hit_pct | pct(False) }}</td></tr>{% endfor %}
++        </tbody>
++      </table>
++      {% endif %}
++    </div>
++    {% endif %}
++
++    {% if s.notes %}
++    <h3>📝 Catatan pola periode ini</h3>
++    <ul>{% for n in s.notes %}<li>{{ n }}</li>{% endfor %}</ul>
++    {% endif %}
++    {% endif %}
++  </div>
++  {% endfor %}
++
++  <div class="card">
++    <p class="mut">Metode: realisasi diambil dari candle harian tersimpan pada tanggal
++      jatuh tempo (toleransi 3 hari). Pemindaian yang horizonnya belum lewat tidak
++      dinilai — tidak ada penilaian prematur. Evaluasi ini menilai alatnya, bukan
++      menjanjikan hasil: kinerja masa lalu aplikasi sama tidak jaminannya dengan
++      kinerja masa lalu pasar.</p>
++  </div>
++</div>
++</body>
++</html>
+diff --git a/tests/test_api.py b/tests/test_api.py
+index 61593e2..06cbb36 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -11,6 +11,7 @@ client = TestClient(app)
+ @pytest.fixture(scope="module", autouse=True)
+ def _pindai_demo():
+     run_scan(30, max_coins=8, min_volume_idr=0)
++    run_scan(7, max_coins=8, min_volume_idr=0)
+ 
+ 
+ def test_health():
+diff --git a/tests/test_evaluate.py b/tests/test_evaluate.py
+new file mode 100644
+index 0000000..cb4f536
+--- /dev/null
++++ b/tests/test_evaluate.py
+@@ -0,0 +1,93 @@
++from datetime import datetime
++
++from app.db import Database
++from app.evaluate import WIB, monthly_report
++from app.scheduler import due_horizons, next_run
++
++TS0 = 1735689600  # 2025-01-01 00:00 UTC
++
++
++def _candles(days=120, growth=1.01, start=100.0):
++    rows, price = [], start
++    for i in range(days):
++        if i:
++            price *= growth
++        rows.append({"ts": TS0 + i * 86400, "open": price, "high": price,
++                     "low": price, "close": price, "volume": 1000.0})
++    return rows
++
++
++def _payload(pair_id, symbol, as_of_idx, price, kelas, prob, median, p25, p75, score):
++    return {
++        "pair_id": pair_id, "symbol": symbol, "horizon_days": 7,
++        "score": score, "classification": kelas, "probability_up": prob,
++        "median_pct": median, "p25_pct": p25, "p75_pct": p75,
++        "price": price, "as_of_ts": TS0 + as_of_idx * 86400,
++    }
++
++
++def _pair(pair_id, symbol):
++    return {"pair_id": pair_id, "symbol": symbol, "name": f"{symbol}/IDR",
++            "traded_currency": symbol.lower(), "coingecko_id": "", "logo": ""}
++
++
++def _db_isi(tmp_path):
++    db = Database(str(tmp_path / "eval.db"))
++    db.init()
++    db.upsert_pairs([_pair("xxx_idr", "XXX"), _pair("yyy_idr", "YYY"),
++                     _pair("zzz_idr", "ZZZ"), _pair("btc_idr", "BTC")], TS0)
++    xxx = _candles()
++    for pid in ("xxx_idr", "yyy_idr", "zzz_idr"):
++        db.upsert_candles(pid, xxx)
++    db.upsert_candles("btc_idr", _candles(growth=1.0, start=50000.0))
++    idx = 50
++    price0 = xxx[idx]["close"]
++    started = TS0 + idx * 86400
++    scan = db.create_scan(7, started)
++    db.update_scan(scan, status="done", finished_at=started)
++    # naik & benar (realisasi +7,2%), turun tapi salah, dan satu belum tempo
++    db.save_result(scan, _payload("xxx_idr", "XXX", idx, price0,
++                                  "Potensi Naik", 70, 5, 0, 10, 80))
++    db.save_result(scan, _payload("yyy_idr", "YYY", idx, price0,
++                                  "Potensi Turun", 30, -5, -10, 0, 20))
++    db.save_result(scan, _payload("zzz_idr", "ZZZ", 118, xxx[118]["close"],
++                                  "Potensi Naik", 60, 4, 0, 9, 70))
++    return db, started
++
++
++def test_evaluasi_menghitung_realisasi(tmp_path):
++    db, started = _db_isi(tmp_path)
++    dt = datetime.fromtimestamp(started, WIB)
++    rep = monthly_report(db, dt.year, dt.month)
++    h7 = rep["horizons"][7]
++    assert rep["n_scans"] == 1
++    assert h7["n_matured"] == 2 and h7["n_pending"] == 1
++    kelas = {c["name"]: c for c in h7["classes"]}
++    assert kelas["Potensi Naik"]["hit_pct"] == 100.0
++    assert kelas["Potensi Turun"]["hit_pct"] == 0.0
++    assert kelas["Potensi Naik"]["avg"] > 7.0  # 1,01^7 - 1
++    assert abs(h7["band_pct"] - 50.0) < 1e-9   # satu masuk rentang, satu tidak
++    kal = {k["label"]: k for k in h7["calibration"]}
++    assert kal["70-100%"]["up_pct"] == 100.0
++    assert kal["0-40%"]["up_pct"] == 100.0  # golongan Turun yang ternyata naik
++
++
++def test_evaluasi_kumulatif_dan_bulan_lain(tmp_path):
++    db, started = _db_isi(tmp_path)
++    rep = monthly_report(db)  # kumulatif
++    assert rep["cumulative"] is True
++    assert rep["horizons"][7]["n_matured"] == 2
++    dt = datetime.fromtimestamp(started, WIB)
++    kosong = monthly_report(db, dt.year, dt.month + 6 if dt.month <= 6 else dt.month)
++    assert kosong["n_scans"] >= 0  # tidak error untuk bulan tanpa data
++
++
++def test_penjadwal_keputusan_jatuh_tempo():
++    pagi = datetime(2026, 10, 15, 5, 0, tzinfo=WIB)
++    lewat = datetime(2026, 10, 15, 7, 0, tzinfo=WIB)
++    assert due_horizons(pagi, {}) == []
++    assert due_horizons(lewat, {}) == [7, 30, 365]
++    baru = int(datetime(2026, 10, 15, 6, 30, tzinfo=WIB).timestamp())
++    assert due_horizons(lewat, {h: baru for h in (7, 30, 365)}) == []
++    assert next_run(pagi).hour == 6 and next_run(pagi).day == 15
++    assert next_run(lewat).day == 16

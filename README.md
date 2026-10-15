@@ -46,7 +46,8 @@ DEMO_MODE=1 venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8020
 venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8020
 ```
 
-Buka `http://localhost:8020`, pilih horizon, klik **Pindai sekarang**.
+Buka `http://localhost:8020`, pilih horizon (1 minggu / 1 bulan / 1 tahun),
+klik **Pindai sekarang**.
 Pemindaian pertama mengambil candle ±3–10 tahun untuk koin acuan dan ±3 tahun
 untuk kandidat (butuh beberapa menit); hasil & candle tersimpan di SQLite
 (`data/scanner.db`) sehingga pemindaian berikutnya jauh lebih cepat.
@@ -93,6 +94,32 @@ memanggil endpoint, atau cukup klik tombol pindai dari dasbor:
 curl -X POST -d "horizon_days=30&max_coins=40&min_volume_idr=100000000" \
   http://localhost:8020/scan/sync
 ```
+
+## Pemindaian terjadwal & evaluasi bulanan
+
+Agar rekam jejak terbentuk tanpa klik manual, aktifkan penjadwal bawaan di
+`.env` server:
+
+```ini
+SCHEDULE_ENABLED=1
+SCHEDULED_HORIZONS=7,30,365
+SCHEDULE_HOUR=6
+SCHEDULE_MINUTE=0
+```
+
+Setiap hari pukul 06.00 WIB ketiga horizon dipindai bergantian (tidak akan
+bertabrakan dengan pemindaian manual). Setiap pemindaian tersimpan permanen
+di SQLite beserta tanggal, harga, dan skenarionya.
+
+Halaman **`/evaluasi`** membandingkan pemindaian lama dengan harga realisasi
+setelah horizonnya jatuh tempo: akurasi arah per kelas (Potensi Naik/Netral/
+Turun), cakupan rentang P25-P75, kekeliruan skenario median, kalibrasi
+probabilitas naik, uji peringkat skor, kinerja per koin, dan selisihnya
+**dibanding sekadar memegang BTC pada jendela waktu yang sama**. Buka halaman
+itu di akhir bulan untuk menilai bulan sebelumnya; tersedia juga tampilan
+kumulatif. Pemindaian yang horizonnya belum lewat tidak dinilai — tidak ada
+penilaian prematur — dan semua tabel menampilkan jumlah sampel (n) karena
+bulan-bulan awal datanya masih sedikit.
 
 ## Tes
 
