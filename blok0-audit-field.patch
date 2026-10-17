@@ -1,0 +1,149 @@
+diff --git a/app/audit.py b/app/audit.py
+new file mode 100644
+index 0000000..4602e84
+--- /dev/null
++++ b/app/audit.py
+@@ -0,0 +1,94 @@
++"""Instrumen audit untuk rubrik evaluasi 30 hari (BLOK 0).
++
++Modul ini TIDAK mengubah logika sinyal sama sekali. Ia hanya menambahkan
++metadata yang menjawab pertanyaan: "hasil ini dibuat oleh kode versi apa,
++dengan parameter apa, dan di atas data yang sehat atau tidak?"
++
++Tanpa tiga hal itu, evaluasi di hari ke-30 tidak bisa membedakan:
++  - sinyal salah  vs  data yang bolong
++  - model berubah  vs  hasil yang memang berubah
++  - skor turun karena pasar  vs  karena ada yang mengubah bobot
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import subprocess
++import time
++from pathlib import Path
++
++_BASE_DIR = Path(__file__).resolve().parent.parent
++
++
++def _git_commit() -> str:
++    """Commit hash pendek; 'unknown' bila bukan repo git (mis. hasil salin .zip)."""
++    try:
++        out = subprocess.run(
++            ["git", "rev-parse", "--short", "HEAD"],
++            cwd=_BASE_DIR, capture_output=True, text=True, timeout=3,
++        )
++        return out.stdout.strip() or "unknown"
++    except Exception:  # noqa: BLE001 - audit tidak boleh menggagalkan pemindaian
++        return "unknown"
++
++
++# Dihitung sekali saat modul diimpor, bukan per kandidat.
++APP_VERSION = _git_commit()
++
++
++def config_hash(cfg: dict) -> str:
++    """Hash stabil dari parameter efektif.
++
++    sort_keys=True WAJIB: tanpa itu urutan dict bisa berbeda antar-run dan
++    hash tidak lagi bisa dipakai membandingkan dua pemindaian.
++    """
++    blob = json.dumps(cfg, sort_keys=True, separators=(",", ":")).encode()
++    return hashlib.sha256(blob).hexdigest()[:12]
++
++
++def quality_flags(candles: list[dict], *, btc_ok: bool,
++                  min_history_days: int = 730) -> list[str]:
++    """Tanda data bermasalah. List kosong = data bersih.
++
++    Ini yang membedakan "sinyal meleset" dari "datanya yang tidak lengkap".
++    Tanpa flag ini, keduanya terlihat sama di halaman evaluasi.
++    """
++    if not candles:
++        return ["no_candles"]
++
++    flags: list[str] = []
++    ts = [int(c["ts"]) for c in candles]
++
++    # Candle terakhir terlalu tua -> pemindaian memakai harga basi.
++    age_days = (int(time.time()) - ts[-1]) / 86400.0
++    if age_days > 2.0:
++        flags.append(f"stale_candle:{age_days:.1f}d")
++
++    # Lubang data: jarak antar candle jauh di atas 1 hari.
++    gaps = sum(1 for a, b in zip(ts, ts[1:]) if (b - a) > 1.5 * 86400)
++    if gaps:
++        flags.append(f"gap_days:{gaps}")
++
++    # Riwayat pendek -> fitur 365 hari dihitung dari posisi, bukan kalender.
++    if len(candles) < min_history_days:
++        flags.append(f"short_history:{len(candles)}d")
++
++    # BTC hilang -> rel_btc_90 diam-diam jadi 0.0 untuk semua kandidat.
++    if not btc_ok:
++        flags.append("btc_benchmark_missing")
++
++    return flags
++
++
++def build_audit_fields(*, cfg: dict, candles: list[dict], btc_ok: bool,
++                       ts_signal: int | None = None) -> dict:
++    """Kumpulan field audit untuk ditempel ke payload hasil."""
++    return {
++        "app_version": APP_VERSION,
++        "config_hash": config_hash(cfg),
++        "config_snapshot": cfg,
++        "ts_signal": int(ts_signal if ts_signal is not None else time.time()),
++        "ts_notify": None,          # belum ada kanal notifikasi
++        "data_quality_flags": quality_flags(candles, btc_ok=btc_ok),
++        "manual_override": None,    # diisi belakangan lewat baris baru
++    }
+diff --git a/app/services.py b/app/services.py
+index b905a05..3447ab7 100644
+--- a/app/services.py
++++ b/app/services.py
+@@ -8,6 +8,7 @@ import time
+ 
+ import numpy as np
+ 
++from .audit import build_audit_fields
+ from .config import settings
+ from .db import Database
+ from .demo import demo_market
+@@ -31,6 +32,21 @@ HORIZONS = (7, 30, 365)
+ _BIG_PCT = {7: 5.0, 30: 10.0, 365: 20.0}
+ _MEDIAN_SCALE = {7: 0.05, 30: 0.10, 365: 0.35}
+ 
++# Semua angka yang menentukan skor, dikumpulkan di satu tempat supaya bisa
++# di-hash. Kalau ada yang mengubah bobot di bawah, config_hash ikut berubah
++# dan hasil dua pemindaian tidak lagi tercampur diam-diam.
++_SCORING_CONFIG = {
++    "weights": {"probability_up": 0.34, "median_score": 0.28,
++                "similarity_avg": 0.18, "trend": 0.20},
++    "big_pct": _BIG_PCT,
++    "median_scale": _MEDIAN_SCALE,
++    "penalty_volume": {"gt_10b": 0, "gt_1b": 3, "gt_100m": 8, "else": 15},
++    "penalty_spread": {"gt_2pct": 8, "gt_1pct": 4},
++    "classify": {"up_score": 60, "up_prob": 55, "down_score": 40, "down_prob": 45},
++    "library": {"step_days": 7, "preselect": 60, "top_k": 12,
++                "dist_weight": 0.65, "shape_weight": 0.35, "per_symbol_cap": 4},
++}
++
+ 
+ def _excluded(pair: dict, summary: dict) -> str | None:
+     """Alasan koin dicoret dari peringkat (None = layak dianalisa)."""
+@@ -281,7 +297,14 @@ def run_scan(horizon_days: int, max_coins: int = 60,
+             plus, minus = _reasons(feat, agg, pair, summ, len(candles))
+             sol_ref = sol_reference_similarity(
+                 library, feat, cand_window, ref_series.get("SOL"))
++            audit = build_audit_fields(
++                cfg={**_SCORING_CONFIG, "horizon_days": horizon_days,
++                     "reference_symbols": settings.reference_symbols},
++                candles=candles,
++                btc_ok=bool(btc_candles),
++            )
+             payload = {
++                **audit,
+                 "pair_id": pair_id,
+                 "symbol": pair["symbol"],
+                 "name": summ.get("name") or pair["name"],
